@@ -4,3 +4,4 @@ cookies.json
 .env
 secrets/
 credentials.json
+data/

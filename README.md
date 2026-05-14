@@ -1,124 +1,183 @@
-# 腾讯云服务器秒杀工具
+# 腾讯云服务器抢购助手
 
-[comment]: <> (Tencent Cloud Server Seckill Tool)
-
-使用 Python 编写的自动化抢购脚本，支持并发抢购腾讯云轻量应用服务器。
+基于 Python 的腾讯云轻量应用服务器抢购工具，支持 Web 页面扫码登录、任务查询、倒计时和自动抢购。
 
 ![Tencent Cloud](image.png)
 
 ## 功能特点
 
-- **自动获取 Cookie**：使用 Playwright 模拟浏览器登录，自动保存登录态
-- **多地域并发抢购**：支持华北、华东、华南同时抢购
-- **实时库存检测**：循环检测目标商品库存状态
-- **服务器时间校准**：自动获取腾讯云服务器时间，确保准时抢购
-- **自动等待秒杀**：监控时间，到点自动发起抢购
+- **Web 页面操作**：通过浏览器创建抢购任务、查询任务状态。
+- **页面内扫码登录**：后端使用 Playwright 打开腾讯云登录页，页面显示二维码截图。
+- **多任务并发**：不同用户 id 对应独立任务、cookie 和结果。
+- **自动计算 Token**：根据 cookie 中的 `skey` 自动计算 `x-csrf-token`。
+- **固定场次抢购**：每天北京时间 `10:00` 和 `15:00` 自动选择下一场。
+- **倒计时展示**：页面实时显示下一场抢购倒计时。
+- **取消任务**：支持取消等待中的抢购任务。
 
 ## 环境要求
 
-- Python 3.8+
+- Python 3.11 推荐
 - Windows / macOS / Linux
+- Playwright Chromium
 
-## 安装步骤
+Windows 部署请优先查看：[README-WINDOWS.md](README-WINDOWS.md)
 
-### 1. 安装依赖
+## 安装依赖
+
+建议使用 conda：
 
 ```bash
-pip install playwright requests
-playwright install chromium
+conda create -y -n tencentyun-snake-up python=3.11
+conda activate tencentyun-snake-up
+pip install -r requirements.txt
+python -m playwright install chromium
 ```
 
-### 2. 获取登录 Cookie
+## 启动 Web 服务
+
+```bash
+python -m uvicorn web_server:app --host 127.0.0.1 --port 8000
+```
+
+启动后访问：
+
+```text
+http://127.0.0.1:8000
+```
+
+如果需要局域网或内网穿透访问，可以改为：
+
+```bash
+python -m uvicorn web_server:app --host 0.0.0.0 --port 8000
+```
+
+## 页面使用流程
+
+### 开始抢购
+
+1. 输入唯一 id，推荐使用邮箱。
+2. 点击“开始抢购”。
+3. 后台打开 Chromium 浏览器。
+4. 页面显示腾讯云登录二维码。
+5. 手机扫码登录腾讯云。
+6. 登录成功后页面显示任务状态和下一场倒计时。
+7. 到每天北京时间 `10:00` 或 `15:00` 自动抢购。
+8. 抢购完成后页面显示成功或失败结果。
+
+### 查询任务
+
+1. 输入已创建任务的 id。
+2. 点击“查询”。
+3. 页面显示任务状态、倒计时或抢购结果。
+
+### 取消抢购
+
+1. 查询或创建任务后，点击“取消抢购”。
+2. 后台任务会进入 `canceled` 状态。
+
+## 后端接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/tasks` | 创建抢购任务 |
+| `GET` | `/api/tasks/{user_id}` | 查询任务状态 |
+| `GET` | `/api/tasks/{user_id}/qr` | 获取二维码截图 |
+| `GET` | `/api/tasks/{user_id}/events` | 订阅任务状态事件 |
+| `POST` | `/api/tasks/{user_id}/cancel` | 取消抢购任务 |
+| `POST` | `/api/admin/clear` | 清空本地所有任务数据 |
+
+清空本地任务数据：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/admin/clear
+```
+
+注意：该接口不会暴露在前端页面，但会删除 `data/tasks/` 下的任务状态、二维码截图、cookie 和结果。
+
+## 数据存储
+
+任务数据保存在：
+
+```text
+data/tasks/
+```
+
+每个任务按用户 id hash 后独立保存：
+
+```text
+data/tasks/<user_id_hash>/
+├── state.json
+├── cookies.json
+├── qr.png
+└── result.json
+```
+
+`data/` 已加入 `.gitignore`，不要提交其中内容。
+
+## 抢购策略
+
+- 抢购场次：每天北京时间 `10:00` 和 `15:00`。
+- 登录成功后自动选择下一场。
+- 秒杀前 5 分钟重新读取 cookie。
+- 根据 cookie 中的 `skey` 计算 `x-csrf-token`。
+- 到点后并发抢购地域 `[1, 4, 8]`。
+
+## 命令行备用方式
+
+项目仍保留原始脚本：
 
 ```bash
 python get_cookies.py
-```
-
-运行后会自动打开浏览器，点击二维码扫码登录腾讯云。登录成功后 Cookie 会自动保存到 `cookies.json` 文件。
-
-## 使用方法
-
-### 配置参数
-
-编辑 `snap_up_server.py` 文件：
-
-1. **设置秒杀时间**（第 197 行）：
-
-```python
-SECKILL_TIME_STR = "2026-02-12 15:00:00"  # 格式：年-月-日 时:分:秒
-```
-
-2. **设置抢购地域**（第 199 行）：
-
-```python
-region_ids = [1, 4, 8]  # 1=华北，4=华东，8=华南
-```
-
-3. **更新 CSRF Token**（第 36 行）：
-
-```
-1. 打开浏览器开发者工具 (F12)
-2. 切换到 Network 标签
-3. 点击任意一个 cloud.tencent.com 的请求
-4. 查看 Request Headers 中的 x-csrf-token
-5. 将值更新到代码中
-```
-
-### 运行秒杀
-
-```bash
 python snap_up_server.py
 ```
 
-脚本会自动：
+说明：
 
-1. 加载登录 Cookie
-2. 校准服务器时间
-3. 循环检测库存
-4. 到达秒杀时间后自动发起抢购
-
-## 地域配置说明
-
-| region_id | 地域         |
-| --------- | ------------ |
-| 1         | 华北（广州） |
-| 4         | 华东（上海） |
-| 8         | 华南（北京） |
-
-## 注意事项
-
-1. **Cookie 有效期**：Cookie 有时效性，建议每次秒杀前重新获取
-2. **CSRF Token**：每次登录后可能变化，秒杀前需确认更新
-3. **抢购成功率**：脚本只提升效率，不保证抢购成功
-4. **仅供学习**：仅限个人学习研究使用，请勿用于商业用途
-
-## 工作原理
-
-1. 加载 `cookies.json` 建立登录会话
-2. 循环调用库存检测接口 (`check-available`)
-3. 检测到有货后，并发调用下单接口 (`do-goods`)
-4. 返回抢购结果
+- `get_cookies.py` 会打开浏览器扫码登录，并保存 `cookies.json`。
+- `snap_up_server.py` 会读取 `cookies.json`，等待下一场 `10:00` 或 `15:00` 抢购。
+- `x-csrf-token` 会自动从 `skey` 计算，不需要手动填写。
 
 ## 常见问题
 
-**Q: 提示 "商品无购买权限"**
-A: 检查是否已通过实名认证，或该商品是否对你的账号开放
+### 二维码截图慢或截偏
 
-**Q: 库存检测正常但抢购失败**
-A: 确认 `x-csrf-token` 是否为最新值，检查 Cookie 是否有效
+当前登录流程使用可见 Chromium：
 
-**Q: 抢购脚本运行正常但无响应**
-A: 检查网络连接，确认秒杀时间是否正确设置
+```python
+headless=False
+```
+
+如果浏览器被最小化、遮挡或系统限制后台渲染，截图可能变慢或异常。建议不要最小化后台 Chromium。
+
+### 提示 id 已存在
+
+同一个 id 只能创建一次任务。可以：
+
+- 输入该 id 后点击“查询”。
+- 调用 `/api/admin/clear` 清空本地任务数据后重新创建。
+
+### 抢购失败
+
+可能原因：
+
+- cookie 已失效。
+- 账号无购买权限。
+- 商品或地域无库存。
+- 腾讯云接口返回异常。
 
 ## 文件结构
 
-```
-tencentyun/
-├── get_cookies.py     # Cookie 获取脚本
-├── snap_up_server.py  # 秒抢购主程序
-├── cookies.json       # 登录 Cookie 存储
-├── image.png          # 演示图片
-└── README.md          # 项目文档
+```text
+tencentyun-snake-up/
+├── web_server.py          # Web 后端服务
+├── web_static/            # Web 前端页面
+├── get_cookies.py         # 命令行 Cookie 获取脚本
+├── snap_up_server.py      # 命令行抢购脚本
+├── requirements.txt       # Python 依赖
+├── README-WINDOWS.md      # Windows 部署说明
+├── design/                # 设计文档
+├── image.png              # 演示图片
+└── README.md              # 项目说明
 ```
 
 ## 免责声明

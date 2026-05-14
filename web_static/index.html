@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>腾讯云抢购助手</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel">
+        <div class="toolbar">
+          <div>
+            <h1>腾讯云抢购助手</h1>
+            <p>输入唯一 id 开始抢购或查询已有任务。</p>
+          </div>
+          <span id="statusBadge" class="badge">未连接</span>
+        </div>
+
+        <form id="taskForm" class="controls">
+          <input id="userId" name="userId" type="text" placeholder="推荐使用邮箱，例如 user@example.com" autocomplete="off" />
+          <button id="startBtn" type="submit">开始抢购</button>
+          <button id="queryBtn" type="button" class="secondary">查询</button>
+          <button id="cancelBtn" type="button" class="danger" disabled>取消抢购</button>
+        </form>
+
+        <div id="message" class="message">等待操作。</div>
+      </section>
+
+      <section class="grid">
+        <div id="qrPanel" class="panel qr-panel">
+          <h2>扫码登录</h2>
+          <div class="qr-frame">
+            <img id="qrImage" alt="腾讯云登录二维码" />
+            <div id="qrLoading" class="qr-loading hidden">
+              <span class="spinner"></span>
+              <span>二维码生成中</span>
+            </div>
+            <span id="qrPlaceholder">二维码生成后显示在这里</span>
+          </div>
+        </div>
+
+        <div id="statePanel" class="panel">
+          <h2>任务状态</h2>
+          <dl class="status-list">
+            <div><dt>用户 id</dt><dd id="stateUserId">-</dd></div>
+            <div><dt>状态</dt><dd id="stateStatus">-</dd></div>
+            <div><dt>下一场</dt><dd id="stateNext">-</dd></div>
+            <div><dt>剩余时间</dt><dd id="stateRemaining">-</dd></div>
+            <div><dt>说明</dt><dd id="stateMessage">-</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>抢购结果</h2>
+        <pre id="resultBox">暂无结果</pre>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
