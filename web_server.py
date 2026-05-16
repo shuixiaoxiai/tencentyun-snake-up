@@ -1,6 +1,7 @@
 import hashlib
 import json
 import random
+import secrets
 import shutil
 import threading
 import time
@@ -19,7 +20,10 @@ from playwright.sync_api import sync_playwright
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data" / "tasks"
+DATA_ROOT = BASE_DIR / "data"
+DATA_DIR = DATA_ROOT / "tasks"
+ADMIN_CONFIG_PATH = DATA_ROOT / "admin_config.json"
+ADMIN_IDS_PATH = DATA_ROOT / "admin_ids.json"
 STATIC_DIR = BASE_DIR / "web_static"
 
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -30,6 +34,9 @@ KEEPALIVE_MIN_SECONDS = 150
 KEEPALIVE_MAX_SECONDS = 210
 KEEPALIVE_FAILURE_LIMIT = 3
 REGION_IDS = [1, 4, 8]
+DEFAULT_MAX_CONCURRENT_TASKS = 2
+VALID_ID_PREFIXES = ("aixiaoxi", "aicailan")
+ACTIVE_TASK_STATUSES = {"created", "waiting_login", "logged_in", "waiting_seckill", "running"}
 
 LOGIN_URL = (
     "https://cloud.tencent.com/login?s_url=https%3A%2F%2Fcloud.tencent.com%2Fact%2Fpro%2Fdouble12-2025"
@@ -70,6 +77,18 @@ class CreateTaskRequest(BaseModel):
     user_id: str
 
 
+class AdminConfigRequest(BaseModel):
+    max_concurrent_tasks: int
+
+
+class GenerateIdsRequest(BaseModel):
+    count: int
+
+
+class BatchStatusRequest(BaseModel):
+    user_ids: list[str]
+
+
 def now_iso() -> str:
     return datetime.now(BEIJING_TZ).isoformat()
 
@@ -95,6 +114,110 @@ def write_json(path: Path, data: Any) -> None:
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     tmp_path.replace(path)
+
+
+def read_admin_config() -> dict[str, Any]:
+    config = read_json(ADMIN_CONFIG_PATH, {})
+    if not isinstance(config, dict):
+        config = {}
+    return {
+        "max_concurrent_tasks": int(config.get("max_concurrent_tasks", DEFAULT_MAX_CONCURRENT_TASKS)),
+    }
+
+
+def write_admin_config(config: dict[str, Any]) -> dict[str, Any]:
+    max_concurrent_tasks = int(config.get("max_concurrent_tasks", DEFAULT_MAX_CONCURRENT_TASKS))
+    if max_concurrent_tasks < 1:
+        raise HTTPException(status_code=400, detail="并发数必须大于等于 1")
+    normalized = {"max_concurrent_tasks": max_concurrent_tasks}
+    write_json(ADMIN_CONFIG_PATH, normalized)
+    return normalized
+
+
+def read_generated_ids() -> dict[str, Any]:
+    data = read_json(ADMIN_IDS_PATH, {"ids": {}})
+    if not isinstance(data, dict):
+        data = {"ids": {}}
+    ids = data.get("ids")
+    if isinstance(ids, list):
+        ids = {value: {"created_at": None} for value in ids if isinstance(value, str)}
+    if not isinstance(ids, dict):
+        ids = {}
+    return {"ids": ids}
+
+
+def write_generated_ids(data: dict[str, Any]) -> None:
+    write_json(ADMIN_IDS_PATH, data)
+
+
+def is_generated_id(user_id: str) -> bool:
+    return user_id in read_generated_ids().get("ids", {})
+
+
+def is_legal_user_id(user_id: str) -> bool:
+    return user_id.startswith(VALID_ID_PREFIXES) or is_generated_id(user_id)
+
+
+def generate_user_ids(count: int) -> list[str]:
+    if count not in {10, 50}:
+        raise HTTPException(status_code=400, detail="只支持生成 10 或 50 个 id")
+    data = read_generated_ids()
+    ids = data["ids"]
+    generated = []
+    while len(generated) < count:
+        value = f"tx-{secrets.token_hex(4)}"
+        if value in ids:
+            continue
+        ids[value] = {"created_at": now_iso()}
+        generated.append(value)
+    write_generated_ids(data)
+    return generated
+
+
+def mark_generated_id_used(user_id: str) -> None:
+    data = read_generated_ids()
+    item = data.get("ids", {}).get(user_id)
+    if isinstance(item, dict):
+        item["used_at"] = item.get("used_at") or now_iso()
+        write_generated_ids(data)
+
+
+def count_active_tasks() -> int:
+    if not DATA_DIR.exists():
+        return 0
+    count = 0
+    for path in DATA_DIR.glob("*/state.json"):
+        try:
+            state = read_json(path, {})
+        except Exception:
+            continue
+        if state.get("status") in ACTIVE_TASK_STATUSES:
+            count += 1
+    return count
+
+
+def task_status_for_user_id(user_id: str) -> dict[str, Any]:
+    task_dir = get_task_dir(user_id)
+    state = read_json(state_path(task_dir), {})
+    if not state:
+        return {
+            "user_id": user_id,
+            "legal": is_legal_user_id(user_id),
+            "exists": False,
+            "status": "not_found",
+            "message": "未找到任务",
+        }
+    state = with_dynamic_remaining(state)
+    return {
+        "user_id": user_id,
+        "legal": is_legal_user_id(user_id),
+        "exists": True,
+        "status": state.get("status"),
+        "message": state.get("message"),
+        "next_seckill_time": state.get("next_seckill_time"),
+        "remaining_seconds": state.get("remaining_seconds"),
+        "updated_at": state.get("updated_at"),
+    }
 
 
 def state_path(task_dir: Path) -> Path:
@@ -534,9 +657,17 @@ def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/admin", response_class=HTMLResponse)
+def admin_index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "admin.html")
+
+
 @app.post("/api/tasks")
 def create_task(payload: CreateTaskRequest) -> dict[str, Any]:
     user_id = sanitize_user_id(payload.user_id)
+    if not is_legal_user_id(user_id):
+        raise HTTPException(status_code=403, detail="该 id 未授权，请先从管理员处获取 id")
+
     task_dir = get_task_dir(user_id)
     if state_path(task_dir).exists():
         state = read_json(state_path(task_dir), {})
@@ -544,6 +675,11 @@ def create_task(payload: CreateTaskRequest) -> dict[str, Any]:
             shutil.rmtree(task_dir)
         else:
             raise HTTPException(status_code=409, detail="该 id 已存在，请使用查询功能查看当前任务")
+
+    config = read_admin_config()
+    active_count = count_active_tasks()
+    if active_count >= config["max_concurrent_tasks"]:
+        raise HTTPException(status_code=429, detail=f"下一场抢购并发已满，当前上限为 {config['max_concurrent_tasks']}")
 
     state = {
         "user_id": user_id,
@@ -555,6 +691,7 @@ def create_task(payload: CreateTaskRequest) -> dict[str, Any]:
         "updated_at": now_iso(),
     }
     write_json(state_path(task_dir), state)
+    mark_generated_id_used(user_id)
 
     get_cancel_event(user_id).clear()
     thread = threading.Thread(target=run_task, args=(user_id,), daemon=True)
@@ -587,6 +724,54 @@ def clear_all_tasks() -> dict[str, Any]:
         shutil.rmtree(DATA_DIR)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     return {"ok": True, "message": "所有本地任务数据已清除"}
+
+
+@app.get("/api/admin/config")
+def get_admin_config() -> dict[str, Any]:
+    config = read_admin_config()
+    return {
+        **config,
+        "active_tasks": count_active_tasks(),
+        "valid_prefixes": list(VALID_ID_PREFIXES),
+    }
+
+
+@app.post("/api/admin/config")
+def update_admin_config(payload: AdminConfigRequest) -> dict[str, Any]:
+    config = write_admin_config({"max_concurrent_tasks": payload.max_concurrent_tasks})
+    return {
+        **config,
+        "active_tasks": count_active_tasks(),
+        "valid_prefixes": list(VALID_ID_PREFIXES),
+    }
+
+
+@app.get("/api/admin/ids")
+def list_admin_ids() -> dict[str, Any]:
+    ids = read_generated_ids().get("ids", {})
+    return {
+        "ids": [{"id": key, **value} for key, value in sorted(ids.items()) if isinstance(value, dict)],
+        "count": len(ids),
+    }
+
+
+@app.post("/api/admin/ids/generate")
+def create_admin_ids(payload: GenerateIdsRequest) -> dict[str, Any]:
+    ids = generate_user_ids(payload.count)
+    return {"ids": ids, "count": len(ids)}
+
+
+@app.post("/api/admin/status")
+def batch_task_status(payload: BatchStatusRequest) -> dict[str, Any]:
+    user_ids = []
+    seen = set()
+    for raw_user_id in payload.user_ids:
+        user_id = sanitize_user_id(raw_user_id)
+        if user_id in seen:
+            continue
+        seen.add(user_id)
+        user_ids.append(user_id)
+    return {"items": [task_status_for_user_id(user_id) for user_id in user_ids]}
 
 
 @app.get("/api/tasks/{user_id}")

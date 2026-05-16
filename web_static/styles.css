@@ -100,6 +100,18 @@ button {
   cursor: pointer;
 }
 
+.link-button {
+  display: inline-grid;
+  align-items: center;
+  height: 42px;
+  border-radius: 6px;
+  background: #e8edf5;
+  color: #26364d;
+  padding: 0 16px;
+  text-decoration: none;
+  font-size: 14px;
+}
+
 button.secondary {
   background: #e8edf5;
   color: #26364d;
@@ -229,8 +241,39 @@ pre {
   font-size: 13px;
 }
 
+.admin-shell textarea {
+  width: 100%;
+  min-height: 140px;
+  resize: vertical;
+  border: 1px solid #c8d2e0;
+  border-radius: 6px;
+  padding: 12px;
+  font: 13px/1.5 Consolas, "Courier New", monospace;
+}
+
+.admin-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+}
+
+.admin-actions {
+  display: flex;
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.admin-textarea.large {
+  min-height: 180px;
+}
+
+.compact-list {
+  margin-top: 16px;
+}
+
 @media (max-width: 760px) {
   .controls,
+  .admin-row,
   .grid {
     grid-template-columns: 1fr;
   }

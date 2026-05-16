@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>抢购管理</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell admin-shell">
+      <section class="panel">
+        <div class="toolbar">
+          <div>
+            <h1>抢购管理</h1>
+            <p>配置下一场抢购并发，生成可用 id，查询任务状态。</p>
+          </div>
+          <a class="link-button" href="/">返回前台</a>
+        </div>
+        <div id="adminMessage" class="message">正在加载配置。</div>
+      </section>
+
+      <section class="grid">
+        <div class="panel">
+          <h2>并发设置</h2>
+          <form id="configForm" class="admin-row">
+            <input id="maxConcurrent" type="number" min="1" step="1" />
+            <button type="submit">保存</button>
+          </form>
+          <dl class="status-list compact-list">
+            <div><dt>当前运行</dt><dd id="activeTasks">-</dd></div>
+            <div><dt>合法前缀</dt><dd id="validPrefixes">-</dd></div>
+          </dl>
+        </div>
+
+        <div class="panel">
+          <h2>生成 id</h2>
+          <div class="admin-actions">
+            <button id="generate10" type="button">生成 10 个</button>
+            <button id="generate50" type="button" class="secondary">生成 50 个</button>
+          </div>
+          <textarea id="generatedIds" class="admin-textarea" readonly placeholder="生成后显示在这里"></textarea>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>批量查询</h2>
+        <textarea id="queryIds" class="admin-textarea large" placeholder="一行一个 id"></textarea>
+        <div class="admin-actions">
+          <button id="queryStatus" type="button">查询状态</button>
+        </div>
+        <pre id="statusResult">暂无结果</pre>
+      </section>
+    </main>
+
+    <script src="/static/admin.js"></script>
+  </body>
+</html>
