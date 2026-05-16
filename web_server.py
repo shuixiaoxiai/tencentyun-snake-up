@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -37,6 +37,9 @@ REGION_IDS = [1, 4, 8]
 DEFAULT_MAX_CONCURRENT_TASKS = 2
 VALID_ID_PREFIXES = ("aixiaoxi", "aicailan")
 ACTIVE_TASK_STATUSES = {"created", "waiting_login", "logged_in", "waiting_seckill", "running"}
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "xshy00000"
+ADMIN_SESSION_COOKIE = "tx_admin_session"
 
 LOGIN_URL = (
     "https://cloud.tencent.com/login?s_url=https%3A%2F%2Fcloud.tencent.com%2Fact%2Fpro%2Fdouble12-2025"
@@ -71,6 +74,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 tasks_lock = threading.Lock()
 running_tasks: dict[str, threading.Thread] = {}
 task_cancel_events: dict[str, threading.Event] = {}
+admin_sessions: set[str] = set()
 
 
 class CreateTaskRequest(BaseModel):
@@ -87,6 +91,11 @@ class GenerateIdsRequest(BaseModel):
 
 class BatchStatusRequest(BaseModel):
     user_ids: list[str]
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
 
 
 def now_iso() -> str:
@@ -114,6 +123,16 @@ def write_json(path: Path, data: Any) -> None:
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     tmp_path.replace(path)
+
+
+def is_admin_authenticated(request: Request) -> bool:
+    token = request.cookies.get(ADMIN_SESSION_COOKIE)
+    return bool(token and token in admin_sessions)
+
+
+def require_admin(request: Request) -> None:
+    if not is_admin_authenticated(request):
+        raise HTTPException(status_code=401, detail="请先登录管理员账号")
 
 
 def read_admin_config() -> dict[str, Any]:
@@ -658,8 +677,43 @@ def index() -> FileResponse:
 
 
 @app.get("/admin", response_class=HTMLResponse)
-def admin_index() -> FileResponse:
+def admin_index(request: Request) -> Response:
+    if not is_admin_authenticated(request):
+        return RedirectResponse("/admin/login", status_code=302)
     return FileResponse(STATIC_DIR / "admin.html")
+
+
+@app.get("/admin/login", response_class=HTMLResponse)
+def admin_login_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "admin_login.html")
+
+
+@app.post("/api/admin/login")
+def admin_login(payload: AdminLoginRequest, response: Response) -> dict[str, Any]:
+    if not (
+        secrets.compare_digest(payload.username, ADMIN_USERNAME)
+        and secrets.compare_digest(payload.password, ADMIN_PASSWORD)
+    ):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    token = secrets.token_urlsafe(32)
+    admin_sessions.add(token)
+    response.set_cookie(
+        ADMIN_SESSION_COOKIE,
+        token,
+        httponly=True,
+        samesite="lax",
+        max_age=12 * 60 * 60,
+    )
+    return {"ok": True}
+
+
+@app.post("/api/admin/logout")
+def admin_logout(request: Request, response: Response) -> dict[str, Any]:
+    token = request.cookies.get(ADMIN_SESSION_COOKIE)
+    if token:
+        admin_sessions.discard(token)
+    response.delete_cookie(ADMIN_SESSION_COOKIE)
+    return {"ok": True}
 
 
 @app.post("/api/tasks")
@@ -714,7 +768,8 @@ def cancel_task(user_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/admin/clear")
-def clear_all_tasks() -> dict[str, Any]:
+def clear_all_tasks(request: Request) -> dict[str, Any]:
+    require_admin(request)
     with tasks_lock:
         for event in task_cancel_events.values():
             event.set()
@@ -727,7 +782,8 @@ def clear_all_tasks() -> dict[str, Any]:
 
 
 @app.get("/api/admin/config")
-def get_admin_config() -> dict[str, Any]:
+def get_admin_config(request: Request) -> dict[str, Any]:
+    require_admin(request)
     config = read_admin_config()
     return {
         **config,
@@ -737,7 +793,8 @@ def get_admin_config() -> dict[str, Any]:
 
 
 @app.post("/api/admin/config")
-def update_admin_config(payload: AdminConfigRequest) -> dict[str, Any]:
+def update_admin_config(payload: AdminConfigRequest, request: Request) -> dict[str, Any]:
+    require_admin(request)
     config = write_admin_config({"max_concurrent_tasks": payload.max_concurrent_tasks})
     return {
         **config,
@@ -747,7 +804,8 @@ def update_admin_config(payload: AdminConfigRequest) -> dict[str, Any]:
 
 
 @app.get("/api/admin/ids")
-def list_admin_ids() -> dict[str, Any]:
+def list_admin_ids(request: Request) -> dict[str, Any]:
+    require_admin(request)
     ids = read_generated_ids().get("ids", {})
     return {
         "ids": [{"id": key, **value} for key, value in sorted(ids.items()) if isinstance(value, dict)],
@@ -756,13 +814,15 @@ def list_admin_ids() -> dict[str, Any]:
 
 
 @app.post("/api/admin/ids/generate")
-def create_admin_ids(payload: GenerateIdsRequest) -> dict[str, Any]:
+def create_admin_ids(payload: GenerateIdsRequest, request: Request) -> dict[str, Any]:
+    require_admin(request)
     ids = generate_user_ids(payload.count)
     return {"ids": ids, "count": len(ids)}
 
 
 @app.post("/api/admin/status")
-def batch_task_status(payload: BatchStatusRequest) -> dict[str, Any]:
+def batch_task_status(payload: BatchStatusRequest, request: Request) -> dict[str, Any]:
+    require_admin(request)
     user_ids = []
     seen = set()
     for raw_user_id in payload.user_ids:

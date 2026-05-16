@@ -9,6 +9,7 @@ const generatedIds = document.querySelector("#generatedIds");
 const queryIds = document.querySelector("#queryIds");
 const queryStatus = document.querySelector("#queryStatus");
 const statusResult = document.querySelector("#statusResult");
+const logoutBtn = document.querySelector("#logoutBtn");
 
 function setAdminMessage(text) {
   adminMessage.textContent = text;
@@ -93,6 +94,11 @@ generate50.addEventListener("click", () => {
 
 queryStatus.addEventListener("click", () => {
   queryStatuses().catch((error) => setAdminMessage(error.message));
+});
+
+logoutBtn.addEventListener("click", async () => {
+  await requestJson("/api/admin/logout", { method: "POST" }).catch(() => ({}));
+  window.location.href = "/admin/login";
 });
 
 loadConfig().catch((error) => setAdminMessage(error.message));

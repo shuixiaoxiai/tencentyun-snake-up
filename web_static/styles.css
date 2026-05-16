@@ -263,6 +263,25 @@ pre {
   margin: 12px 0;
 }
 
+.admin-nav {
+  display: flex;
+  gap: 12px;
+}
+
+.login-shell {
+  width: min(420px, calc(100% - 32px));
+}
+
+.login-panel {
+  margin-top: 12vh;
+}
+
+.login-form {
+  display: grid;
+  gap: 12px;
+  margin-top: 20px;
+}
+
 .admin-textarea.large {
   min-height: 180px;
 }
