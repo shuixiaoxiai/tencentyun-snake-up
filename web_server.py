@@ -1,5 +1,6 @@
 import hashlib
 import json
+import random
 import shutil
 import threading
 import time
@@ -25,6 +26,9 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 SECKILL_HOURS = (10, 15)
 TOKEN_REFRESH_BEFORE_SECONDS = 5 * 60
 SERVER_TIME_CHECK_INTERVAL_SECONDS = 1
+KEEPALIVE_MIN_SECONDS = 150
+KEEPALIVE_MAX_SECONDS = 210
+KEEPALIVE_FAILURE_LIMIT = 3
 REGION_IDS = [1, 4, 8]
 
 LOGIN_URL = (
@@ -228,6 +232,38 @@ def create_session(cookies: list[dict[str, Any]]) -> requests.Session:
     return session
 
 
+def build_session_and_headers(cookies: list[dict[str, Any]]) -> tuple[requests.Session, dict[str, str]]:
+    skey = get_cookie_value(cookies, "skey")
+    if not skey:
+        raise RuntimeError("cookies中未找到skey")
+    headers = dict(BASE_HEADERS)
+    headers["x-csrf-token"] = calc_csrf_token(skey)
+    return create_session(cookies), headers
+
+
+def next_keepalive_delay() -> int:
+    return random.randint(KEEPALIVE_MIN_SECONDS, KEEPALIVE_MAX_SECONDS)
+
+
+def refresh_cookies_from_browser(
+    user_id: str,
+    page: Any,
+    context: Any,
+    *,
+    strong: bool = False,
+) -> list[dict[str, Any]]:
+    wait_until = "networkidle" if strong else "domcontentloaded"
+    page.goto(ACTIVITY_URL, wait_until=wait_until, timeout=30000)
+    if not strong:
+        page.wait_for_timeout(random.randint(2000, 5000))
+    cookies = context.cookies()
+    if not get_cookie_value(cookies, "skey") or not get_cookie_value(cookies, "uin"):
+        raise RuntimeError("浏览器登录态缺少skey或uin")
+    write_json(cookies_path(get_task_dir(user_id)), cookies)
+    update_state(user_id, last_cookie_refresh_at=now_iso(), browser_alive=True)
+    return cookies
+
+
 def get_server_time() -> int | None:
     response = requests.head(ACTIVITY_URL, timeout=10)
     server_time = response.headers.get("Date")
@@ -304,55 +340,81 @@ def buy_now_concurrent(session: requests.Session, headers: dict[str, str]) -> di
     return {"success": False, "results": results}
 
 
-def run_login(user_id: str) -> None:
-    task_dir = get_task_dir(user_id)
+def run_task(user_id: str) -> None:
+    browser = None
+    context = None
     try:
-        cancel_event = get_cancel_event(user_id)
-        update_state(user_id, status="waiting_login", message="等待扫码登录")
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=False)
             context = browser.new_context(viewport={"width": 1280, "height": 900})
             page = context.new_page()
-            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
-
-            for _ in range(10):
-                if cancel_event.is_set():
-                    browser.close()
-                    mark_task_cancelled(user_id)
-                    return
-                try:
-                    capture_qr_area(page, qr_path(task_dir))
-                    update_state(user_id, qr_ready=True, message="二维码已生成，请扫码登录")
-                    break
-                except Exception:
-                    time.sleep(1)
-
-            login_deadline = time.monotonic() + 10 * 60
-            while time.monotonic() < login_deadline:
-                if cancel_event.is_set():
-                    browser.close()
-                    mark_task_cancelled(user_id)
-                    return
-                cookies = context.cookies()
-                if get_cookie_value(cookies, "skey") and get_cookie_value(cookies, "uin"):
-                    write_json(cookies_path(task_dir), cookies)
-                    update_state(user_id, status="logged_in", message="登录成功，cookie已读取")
-                    browser.close()
-                    run_seckill(user_id)
-                    return
-                try:
-                    capture_qr_area(page, qr_path(task_dir))
-                except PlaywrightTimeoutError:
-                    pass
-                time.sleep(2)
-
-            browser.close()
-            update_state(user_id, status="failed", message="登录超时，请重新创建任务")
+            run_login(user_id, page, context)
+            state = read_json(state_path(get_task_dir(user_id)), {})
+            if not is_task_cancelled(user_id) and state.get("status") == "logged_in":
+                run_seckill(user_id, page, context)
     except Exception as exc:
-        update_state(user_id, status="failed", message=f"登录流程失败: {exc}")
+        state = read_json(state_path(get_task_dir(user_id)), {})
+        if state.get("status") not in {"success", "failed", "canceled"}:
+            update_state(user_id, status="failed", message=f"任务流程失败: {exc}", browser_alive=False)
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        update_state(user_id, browser_alive=False)
+        with tasks_lock:
+            running_tasks.pop(user_id, None)
 
 
-def run_seckill(user_id: str) -> None:
+def run_login(user_id: str, page: Any, context: Any) -> None:
+    task_dir = get_task_dir(user_id)
+    cancel_event = get_cancel_event(user_id)
+    update_state(user_id, status="waiting_login", message="等待扫码登录", browser_alive=True)
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+
+    for _ in range(10):
+        if cancel_event.is_set():
+            mark_task_cancelled(user_id)
+            return
+        try:
+            capture_qr_area(page, qr_path(task_dir))
+            update_state(user_id, qr_ready=True, message="二维码已生成，请使用另一台设备摄像头扫码登录")
+            break
+        except Exception:
+            time.sleep(1)
+
+    login_deadline = time.monotonic() + 10 * 60
+    while time.monotonic() < login_deadline:
+        if cancel_event.is_set():
+            mark_task_cancelled(user_id)
+            return
+        cookies = context.cookies()
+        if get_cookie_value(cookies, "skey") and get_cookie_value(cookies, "uin"):
+            write_json(cookies_path(task_dir), cookies)
+            update_state(
+                user_id,
+                status="logged_in",
+                message="登录成功，浏览器会话将保持到抢购结束",
+                browser_alive=True,
+                last_cookie_refresh_at=now_iso(),
+            )
+            return
+        try:
+            capture_qr_area(page, qr_path(task_dir))
+        except PlaywrightTimeoutError:
+            pass
+        time.sleep(2)
+
+    update_state(user_id, status="failed", message="登录超时，请重新创建任务")
+
+
+def run_seckill(user_id: str, page: Any, context: Any) -> None:
     task_dir = get_task_dir(user_id)
     try:
         cancel_event = get_cancel_event(user_id)
@@ -376,9 +438,17 @@ def run_seckill(user_id: str) -> None:
             ),
         )
 
-        headers = dict(BASE_HEADERS)
         session = None
+        headers = None
         token_ready = False
+        keepalive_failures = 0
+        delay = next_keepalive_delay()
+        next_keepalive_at = time.monotonic() + delay
+        update_state(
+            user_id,
+            browser_alive=True,
+            next_cookie_refresh_at=datetime.fromtimestamp(time.time() + delay, BEIJING_TZ).isoformat(),
+        )
 
         while True:
             if cancel_event.is_set():
@@ -392,31 +462,53 @@ def run_seckill(user_id: str) -> None:
             remaining_seconds = max(0, (seckill_timestamp - current_time) // 1000)
             update_state(user_id, remaining_seconds=remaining_seconds)
 
+            if not token_ready and time.monotonic() >= next_keepalive_at:
+                try:
+                    refresh_cookies_from_browser(user_id, page, context)
+                    keepalive_failures = 0
+                    delay = next_keepalive_delay()
+                    next_keepalive_at = time.monotonic() + delay
+                    update_state(
+                        user_id,
+                        message="登录态已保活刷新",
+                        next_cookie_refresh_at=datetime.fromtimestamp(time.time() + delay, BEIJING_TZ).isoformat(),
+                    )
+                except Exception as exc:
+                    keepalive_failures += 1
+                    update_state(user_id, message=f"登录态保活刷新失败({keepalive_failures}/3): {exc}")
+                    if keepalive_failures >= KEEPALIVE_FAILURE_LIMIT:
+                        raise RuntimeError("登录态保活连续失败，请重新扫码")
+                    delay = next_keepalive_delay()
+                    next_keepalive_at = time.monotonic() + delay
+
             if not token_ready and current_time >= token_refresh_timestamp:
-                cookies = read_json(cookies_path(task_dir), [])
-                skey = get_cookie_value(cookies, "skey")
-                if not skey:
-                    raise RuntimeError("cookies中未找到skey")
-                headers["x-csrf-token"] = calc_csrf_token(skey)
-                session = create_session(cookies)
+                cookies = refresh_cookies_from_browser(user_id, page, context, strong=True)
+                session, headers = build_session_and_headers(cookies)
                 token_ready = True
-                update_state(user_id, message="x-csrf-token已刷新")
+                update_state(user_id, message="抢购前登录态和x-csrf-token已刷新")
 
             if current_time >= seckill_timestamp:
-                if not token_ready:
-                    cookies = read_json(cookies_path(task_dir), [])
-                    skey = get_cookie_value(cookies, "skey")
-                    if not skey:
-                        raise RuntimeError("cookies中未找到skey")
-                    headers["x-csrf-token"] = calc_csrf_token(skey)
-                    session = create_session(cookies)
+                cookies = refresh_cookies_from_browser(user_id, page, context, strong=True)
+                session, headers = build_session_and_headers(cookies)
                 update_state(user_id, status="running", message="正在执行抢购", remaining_seconds=0)
                 result = buy_now_concurrent(session, headers)
                 write_json(result_path(task_dir), result)
+                failed_by_login = any(
+                    isinstance(item, dict)
+                    and isinstance(item.get("body"), dict)
+                    and item["body"].get("code") == "NOT-LOGINED"
+                    for item in result.get("results", [])
+                )
                 update_state(
                     user_id,
                     status="success" if result.get("success") else "failed",
-                    message="抢购成功" if result.get("success") else "抢购失败",
+                    message=(
+                        "抢购成功"
+                        if result.get("success")
+                        else "登录态校验失败，请重新扫码"
+                        if failed_by_login
+                        else "抢购失败"
+                    ),
                     result=result,
                 )
                 return
@@ -465,7 +557,7 @@ def create_task(payload: CreateTaskRequest) -> dict[str, Any]:
     write_json(state_path(task_dir), state)
 
     get_cancel_event(user_id).clear()
-    thread = threading.Thread(target=run_login, args=(user_id,), daemon=True)
+    thread = threading.Thread(target=run_task, args=(user_id,), daemon=True)
     with tasks_lock:
         running_tasks[user_id] = thread
     thread.start()
@@ -548,10 +640,10 @@ def resume_waiting_tasks() -> None:
         user_id = state.get("user_id")
         if not user_id or state.get("status") not in {"logged_in", "waiting_seckill"}:
             continue
-        if not cookies_path(get_task_dir(user_id)).exists():
-            continue
-        get_cancel_event(user_id).clear()
-        thread = threading.Thread(target=run_seckill, args=(user_id,), daemon=True)
-        with tasks_lock:
-            running_tasks[user_id] = thread
-        thread.start()
+        update_state(
+            user_id,
+            status="failed",
+            message="服务重启后浏览器会话已失效，请重新开始抢购",
+            browser_alive=False,
+            remaining_seconds=0,
+        )
