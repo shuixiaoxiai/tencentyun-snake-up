@@ -447,7 +447,11 @@ def create_task(payload: CreateTaskRequest) -> dict[str, Any]:
     user_id = sanitize_user_id(payload.user_id)
     task_dir = get_task_dir(user_id)
     if state_path(task_dir).exists():
-        raise HTTPException(status_code=409, detail="该id已存在，请使用查询功能")
+        state = read_json(state_path(task_dir), {})
+        if state.get("status") == "failed":
+            shutil.rmtree(task_dir)
+        else:
+            raise HTTPException(status_code=409, detail="该 id 已存在，请使用查询功能查看当前任务")
 
     state = {
         "user_id": user_id,

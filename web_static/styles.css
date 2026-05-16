@@ -44,6 +44,13 @@ h2 {
   font-size: 16px;
 }
 
+.qr-note {
+  margin: -4px 0 14px;
+  color: #475467;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
 p {
   margin-top: 8px;
   color: #667085;
